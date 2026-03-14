@@ -1,9 +1,11 @@
 """
-Scraper de precios supermercados Uruguay — v2
-Fixes: VTEX IO API + Tienda Inglesa pagination/price parsing
+Scraper de precios supermercados Uruguay — v3
+Fixes:
+  - VTEX: usa API clásica con filtro por categoría fq=C:/id/
+  - TI: URL paginación correcta (4 comas), dedup por sku_id, regex precio
 """
 
-import os, time, logging, requests
+import os, re, time, logging, requests
 from datetime import datetime, timezone
 from supabase import create_client, Client
 from bs4 import BeautifulSoup
@@ -14,48 +16,59 @@ log = logging.getLogger(__name__)
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-VTEX_CHAINS = {
-    "disco":   "https://www.disco.com.uy",
-    "devoto":  "https://www.devoto.com.uy",
-    "geant":   "https://www.geant.com.uy",
-    "tata":    "https://www.tata.com.uy",
-}
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json",
     "Accept-Language": "es-UY,es;q=0.9",
 }
 
-PAGE_SIZE = 50
 SLEEP_MS  = 400
+PAGE_SIZE = 50
 
+# Categorías VTEX por cadena: (nombre_display, category_id_en_vtex)
+VTEX_CHAINS = {
+    "disco": {
+        "base": "https://www.disco.com.uy",
+        "cats": [10, 11, 12, 14, 15, 20, 21, 22, 30, 31, 40, 41, 42, 43, 50],
+    },
+    "devoto": {
+        "base": "https://www.devoto.com.uy",
+        "cats": [10, 11, 12, 14, 15, 20, 21, 22, 30, 31, 40, 41, 42, 43, 50],
+    },
+    "geant": {
+        "base": "https://www.geant.com.uy",
+        "cats": [10, 11, 12, 14, 15, 20, 21, 22, 30, 31, 40, 41, 42, 43, 50],
+    },
+    "tata": {
+        "base": "https://www.tata.com.uy",
+        "cats": [10, 11, 12, 14, 15, 20, 21, 22, 30, 31, 40, 41],
+    },
+}
 
-# ── VTEX IO Intelligent Search API ───────────────────────────────────────────
-# Estas cadenas usan VTEX IO (tienda moderna), que expone un endpoint distinto
-# al VTEX clásico. El endpoint correcto es /api/io/_v/api/intelligent-search/
+# ── VTEX clásico con filtro por categoría ─────────────────────────────────────
 
-def vtex_io_get_products(base_url: str, page: int, count: int = PAGE_SIZE) -> dict:
-    """
-    Llama la VTEX IO Intelligent Search API.
-    Devuelve el JSON completo (con 'products' y 'pagination').
-    """
+def vtex_search_page(base: str, cat_id: int, from_: int) -> list[dict]:
+    """Llama la VTEX Search API filtrando por categoría."""
     url = (
-        f"{base_url}/api/io/_v/api/intelligent-search/product_search/"
-        f"?count={count}&page={page}&sort=orders%3Adesc"
+        f"{base}/api/catalog_system/pub/products/search/"
+        f"?fq=C%3A%2F{cat_id}%2F"
+        f"&_from={from_}&_to={from_ + PAGE_SIZE - 1}"
+        f"&O=OrderByTopSaleDESC"
     )
     r = requests.get(url, headers=HEADERS, timeout=20)
     if r.status_code in (404, 400):
-        return {}
+        return []
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    return data if isinstance(data, list) else []
 
 
-def parse_vtex_io_product(product: dict, chain: str) -> list[dict]:
-    """Convierte un producto VTEX IO a filas de precios."""
+def parse_vtex_product(product: dict, chain: str) -> list[dict]:
     rows = []
+    cats = product.get("categories") or [""]
+    cat  = cats[0].strip("/").split("/")[-1] if cats else ""
     for item in product.get("items", []):
-        ean     = item.get("ean")
+        ean     = item.get("ean") or (item.get("referenceId") or [{}])[0].get("Value")
         sellers = item.get("sellers", [])
         if not sellers:
             continue
@@ -70,7 +83,7 @@ def parse_vtex_io_product(product: dict, chain: str) -> list[dict]:
             "sku_id":     str(item.get("itemId", "")),
             "name":       product.get("productName", ""),
             "brand":      product.get("brand", ""),
-            "category":   (product.get("categories") or [""])[0].strip("/").split("/")[-1],
+            "category":   cat,
             "image_url":  (item.get("images") or [{}])[0].get("imageUrl", ""),
             "price":      float(price),
             "list_price": float(offer.get("ListPrice") or price),
@@ -80,127 +93,149 @@ def parse_vtex_io_product(product: dict, chain: str) -> list[dict]:
     return rows
 
 
-def scrape_vtex_chain(chain: str, base_url: str) -> list[dict]:
-    """Itera todas las páginas de una cadena VTEX IO."""
-    all_rows = []
-    log.info(f"[{chain}] Iniciando VTEX IO → {base_url}")
+def scrape_vtex_chain(chain: str, cfg: dict) -> list[dict]:
+    base     = cfg["base"]
+    cat_ids  = cfg["cats"]
+    all_rows = {}  # dedup por sku_id
 
-    for page in range(1, 500):  # VTEX IO es 1-indexed
-        try:
-            data = vtex_io_get_products(base_url, page)
-        except Exception as e:
-            log.warning(f"[{chain}] Error en página {page}: {e}")
-            break
+    log.info(f"[{chain}] Iniciando — {len(cat_ids)} categorías")
 
-        products = data.get("products", [])
-        if not products:
-            log.info(f"[{chain}] Sin más productos en página {page}. Total: {len(all_rows)}")
-            break
+    for cat_id in cat_ids:
+        page = 0
+        while True:
+            try:
+                products = vtex_search_page(base, cat_id, page * PAGE_SIZE)
+            except Exception as e:
+                log.warning(f"[{chain}][cat={cat_id}] Error página {page}: {e}")
+                break
 
-        for p in products:
-            all_rows.extend(parse_vtex_io_product(p, chain))
+            if not products:
+                break
 
-        # Verificar si hay más páginas usando el objeto pagination
-        pagination = data.get("pagination", {})
-        total      = pagination.get("count", 0)
-        per_page   = pagination.get("perPage", PAGE_SIZE)
-        if total and page * per_page >= total:
-            log.info(f"[{chain}] Última página ({page}). Total: {len(all_rows)}")
-            break
+            for p in products:
+                for row in parse_vtex_product(p, chain):
+                    all_rows[row["sku_id"]] = row  # dedup
 
-        log.info(f"[{chain}] Página {page} → {len(products)} prods | acum={len(all_rows)}")
-        time.sleep(SLEEP_MS / 1000)
+            log.info(f"[{chain}][cat={cat_id}] p{page} +{len(products)} | total={len(all_rows)}")
+            page += 1
+            time.sleep(SLEEP_MS / 1000)
 
-    return all_rows
+    result = list(all_rows.values())
+    log.info(f"[{chain}] Total productos únicos: {len(result)}")
+    return result
 
 
-# ── Tienda Inglesa (HTML scraper) ─────────────────────────────────────────────
-# Fix 1: el precio está en el elemento PADRE del <a>, no dentro del <a>
-# Fix 2: detectar fin de paginación comparando el primer producto de cada página
+# ── Tienda Inglesa ─────────────────────────────────────────────────────────────
+
+# URL correcta de paginación — 4 comas después de 'false': ,,,false,,,,{page}
+TI_CAT_URL = (
+    "https://www.tiendainglesa.com.uy/supermercado/categoria"
+    "/{cat}/busqueda?0,0,*:*,{cat_id},0,0,,,false,,,,{page}"
+)
+
+TI_CATEGORIES = [
+    ("almacen",    78),
+    ("bebidas",    79),
+    ("lacteos",    80),
+    ("carnes",     81),
+    ("verduleria", 82),
+    ("limpieza",   83),
+    ("perfumeria", 84),
+    ("congelados", 85),
+]
+
+PRICE_RE = re.compile(r'\$\s*([\d.,]+)')
+
+
+def parse_price(text: str) -> float | None:
+    """Extrae float de texto tipo '$ 1.234,56' o '$ 236'."""
+    if not text:
+        return None
+    m = PRICE_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1).replace(".", "").replace(",", ".")
+    try:
+        val = float(raw)
+        return val if 1 < val < 999999 else None
+    except ValueError:
+        return None
+
 
 def scrape_tienda_inglesa() -> list[dict]:
-    chain = "tienda_inglesa"
-    rows  = []
+    chain     = "tienda_inglesa"
+    seen      = {}   # sku_id → row (dedup dentro de la misma cadena)
 
-    categories = [
-        ("almacen",    78),
-        ("bebidas",    79),
-        ("lacteos",    80),
-        ("limpieza",   83),
-        ("perfumeria", 84),
-        ("congelados", 85),
-    ]
+    log.info(f"[{chain}] Iniciando")
 
-    log.info(f"[{chain}] Iniciando HTML scraper")
+    for cat_name, cat_id in TI_CATEGORIES:
+        prev_first_href = None
 
-    for cat_name, cat_id in categories:
-        first_product_prev_page = None  # para detectar el fin de paginación
-
-        for page in range(200):
-            url = (
-                f"https://www.tiendainglesa.com.uy/supermercado/categoria"
-                f"/{cat_name}/busqueda?0,0,*:*,{cat_id},0,0,,,false,,,{page}"
-            )
+        for page in range(300):
+            url = TI_CAT_URL.format(cat=cat_name, cat_id=cat_id, page=page)
             try:
-                r = requests.get(url, headers={**HEADERS, "Accept": "text/html"}, timeout=20)
+                r = requests.get(
+                    url,
+                    headers={**HEADERS, "Accept": "text/html"},
+                    timeout=20
+                )
                 r.raise_for_status()
             except Exception as e:
-                log.warning(f"[{chain}][{cat_name}] Error página {page}: {e}")
+                log.warning(f"[{chain}][{cat_name}] Error p{page}: {e}")
                 break
 
-            soup  = BeautifulSoup(r.text, "html.parser")
-            cards = soup.select("a[href*='.producto']")
+            soup = BeautifulSoup(r.text, "html.parser")
 
-            if not cards:
-                log.info(f"[{chain}][{cat_name}] Sin cards en página {page} → fin")
+            # Detectar fin real: el paginador incluye el total "(1 - 40 de 2815)"
+            # Si no hay ese breadcrumb, la página no existe
+            breadcrumb = soup.find(string=re.compile(r'\d+\s*-\s*\d+\s+de\s+\d+'))
+            if not breadcrumb and page > 0:
+                log.info(f"[{chain}][{cat_name}] Sin breadcrumb en p{page} → fin")
                 break
 
-            # Detectar loop: si el primer producto es igual al de la página anterior, paramos
-            first_href = cards[0].get("href", "")
-            if first_href and first_href == first_product_prev_page:
-                log.info(f"[{chain}][{cat_name}] Página {page} repite contenido → fin real")
-                break
-            first_product_prev_page = first_href
+            # Solo los <a> que tienen texto (no los de imágenes)
+            name_links = [
+                a for a in soup.select("a[href*='.producto']")
+                if a.get_text(strip=True)
+            ]
 
-            page_rows = 0
-            for card in cards:
-                href = card.get("href", "")
+            if not name_links:
+                log.info(f"[{chain}][{cat_name}] Sin productos en p{page} → fin")
+                break
+
+            # Anti-loop: detectar si la página repite el primer producto
+            first_href = name_links[0].get("href", "")
+            if first_href == prev_first_href:
+                log.info(f"[{chain}][{cat_name}] Página {page} repite contenido → fin")
+                break
+            prev_first_href = first_href
+
+            found = 0
+            for a_name in name_links:
+                href    = a_name.get("href", "")
                 prod_id = href.split("?")[-1].split(",")[0] if "?" in href else ""
+                name    = a_name.get_text(strip=True)
 
-                # Nombre: está dentro del <a>
-                name_el = card.select_one("span, div")
-                name    = name_el.get_text(strip=True) if name_el else card.get_text(strip=True)
-                if not name:
+                if not name or not prod_id:
                     continue
 
-                # FIX: el precio está en el elemento PADRE del <a>, no dentro
-                parent   = card.parent
-                price_el = None
-                if parent:
-                    # Buscar texto con "$" en el padre (excluyendo el <a> en sí)
-                    for sibling in parent.children:
-                        text = getattr(sibling, 'string', None) or (
-                            sibling.get_text(strip=True) if hasattr(sibling, 'get_text') else str(sibling)
-                        )
-                        if text and "$" in text and sibling != card:
-                            price_el = text.strip()
-                            break
-                    # Fallback: cualquier texto con $ en el padre
-                    if not price_el:
-                        price_el = parent.find(string=lambda t: t and "$" in t and t.strip() != "$")
+                # El precio es un text node suelto en el mismo contenedor padre
+                # Buscamos hacia arriba hasta encontrar un bloque que contenga "$"
+                price = None
+                container = a_name.parent
+                for _ in range(4):  # máximo 4 niveles arriba
+                    if container is None:
+                        break
+                    full_text = container.get_text(" ", strip=True)
+                    price = parse_price(full_text)
+                    if price:
+                        break
+                    container = container.parent
 
-                if not price_el:
+                if price is None:
                     continue
 
-                price_str = str(price_el).strip().replace("$", "").replace(".", "").replace(",", ".").strip()
-                try:
-                    price = float(price_str)
-                    if price <= 0 or price > 999999:
-                        continue
-                except (ValueError, TypeError):
-                    continue
-
-                rows.append({
+                seen[prod_id] = {
                     "ean":        None,
                     "chain":      chain,
                     "product_id": prod_id,
@@ -213,14 +248,15 @@ def scrape_tienda_inglesa() -> list[dict]:
                     "list_price": price,
                     "available":  True,
                     "scraped_at": datetime.now(timezone.utc).isoformat(),
-                })
-                page_rows += 1
+                }
+                found += 1
 
-            log.info(f"[{chain}][{cat_name}] Página {page}: {len(cards)} cards, {page_rows} con precio")
+            log.info(f"[{chain}][{cat_name}] p{page}: {len(name_links)} links, {found} con precio")
             time.sleep(SLEEP_MS / 1000)
 
-    log.info(f"[{chain}] Total: {len(rows)}")
-    return rows
+    result = list(seen.values())
+    log.info(f"[{chain}] Total: {len(result)}")
+    return result
 
 
 # ── Supabase upsert ───────────────────────────────────────────────────────────
@@ -229,22 +265,26 @@ def upsert_prices(supabase: Client, rows: list[dict], chain: str) -> dict:
     if not rows:
         return {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 0}
 
-    stats = {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 0}
-
-    # Traer precios actuales para detectar cambios
+    stats    = {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 0}
     existing = {}
     try:
         resp = supabase.table("prices_current").select("sku_id,price").eq("chain", chain).execute()
-        for row in resp.data:
-            existing[row["sku_id"]] = float(row["price"])
+        for r in resp.data:
+            existing[r["sku_id"]] = float(r["price"])
     except Exception as e:
-        log.warning(f"No se pudo cargar precios actuales para {chain}: {e}")
+        log.warning(f"No se pudo cargar precios actuales: {e}")
 
     price_changes = []
     BATCH = 500
 
     for i in range(0, len(rows), BATCH):
         batch = rows[i : i + BATCH]
+
+        # Dedup dentro del batch (por si acaso)
+        seen_in_batch = {}
+        for row in batch:
+            seen_in_batch[row["sku_id"]] = row
+        batch = list(seen_in_batch.values())
 
         for row in batch:
             old = existing.get(row["sku_id"])
@@ -254,7 +294,7 @@ def upsert_prices(supabase: Client, rows: list[dict], chain: str) -> dict:
                 stats["updated"] += 1
                 pct = ((row["price"] - old) / old) * 100
                 price_changes.append({
-                    "chain":       row["chain"],
+                    "chain":       chain,
                     "sku_id":      row["sku_id"],
                     "name":        row["name"],
                     "old_price":   old,
@@ -267,17 +307,19 @@ def upsert_prices(supabase: Client, rows: list[dict], chain: str) -> dict:
 
         try:
             supabase.table("prices_history").insert(batch).execute()
-            supabase.table("prices_current").upsert(batch, on_conflict="chain,sku_id").execute()
+            supabase.table("prices_current").upsert(
+                batch, on_conflict="chain,sku_id"
+            ).execute()
         except Exception as e:
-            log.error(f"Batch error: {e}")
+            log.error(f"Batch {i//BATCH} error: {e}")
             stats["errors"] += len(batch)
 
     if price_changes:
         try:
             supabase.table("price_changes").insert(price_changes).execute()
-            log.info(f"[{chain}] {len(price_changes)} cambios de precio registrados")
+            log.info(f"[{chain}] {len(price_changes)} cambios de precio")
         except Exception as e:
-            log.warning(f"Error guardando price_changes: {e}")
+            log.warning(f"price_changes error: {e}")
 
     return stats
 
@@ -286,24 +328,24 @@ def upsert_prices(supabase: Client, rows: list[dict], chain: str) -> dict:
 
 def main():
     log.info("=" * 60)
-    log.info("precios-uy scraper v2 — VTEX IO + TI fix")
+    log.info("precios-uy v3")
     log.info("=" * 60)
 
     sb        = create_client(SUPABASE_URL, SUPABASE_KEY)
     run_start = datetime.now(timezone.utc)
 
-    scrapers = {
-        **{chain: ("vtex", url) for chain, url in VTEX_CHAINS.items()},
+    jobs = {
+        **{chain: ("vtex", cfg) for chain, cfg in VTEX_CHAINS.items()},
         "tienda_inglesa": ("ti", None),
     }
 
-    for chain, (kind, url) in scrapers.items():
+    for chain, (kind, cfg) in jobs.items():
         t0 = time.time()
         try:
-            rows  = scrape_vtex_chain(chain, url) if kind == "vtex" else scrape_tienda_inglesa()
+            rows  = scrape_vtex_chain(chain, cfg) if kind == "vtex" else scrape_tienda_inglesa()
             stats = upsert_prices(sb, rows, chain)
         except Exception as e:
-            log.error(f"[{chain}] FALLO TOTAL: {e}")
+            log.error(f"[{chain}] FALLO: {e}")
             rows, stats = [], {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 1}
 
         elapsed = round(time.time() - t0, 1)
@@ -320,11 +362,12 @@ def main():
                 "status":        "ok" if stats["errors"] == 0 else "partial",
             }).execute()
         except Exception as e:
-            log.error(f"Error guardando log: {e}")
+            log.error(f"Log error: {e}")
 
         log.info(
-            f"[{chain}] scraped={len(rows)} new={stats['inserted']} "
-            f"updated={stats['updated']} errors={stats['errors']} ({elapsed}s)"
+            f"[{chain}] scraped={len(rows)} "
+            f"new={stats['inserted']} updated={stats['updated']} "
+            f"errors={stats['errors']} ({elapsed}s)"
         )
 
     log.info("=" * 60 + " FIN")

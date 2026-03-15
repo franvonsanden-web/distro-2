@@ -34,8 +34,6 @@ jobs:
 
 Los dos cambios respecto al original: `timeout-minutes: 90` (Playwright con 5 cadenas puede tardar 30-60 min) y el paso `playwright install chromium --with-deps` que descarga el browser headless.
 
----
-
 También confirmá que el `requirements.txt` del nuevo scraper incluye `playwright`. Debería tener algo así:
 ```
 requests==2.31.0

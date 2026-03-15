@@ -17,15 +17,25 @@ from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
+# Cargar .env si existe (local). En GitHub Actions las vars vienen de Secrets.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-MAX_PRICE       = 999_999.0
-MAX_PAGES       = 150        # límite de seguridad
+MAX_PRICE        = 999_999.0
+MAX_PAGES        = 150       # límite de seguridad
 MAX_CONSEC_EMPTY = 3         # páginas vacías consecutivas antes de parar
+GDU_PAGE_DELAY   = 1.5       # segundos entre páginas (evita throttling desde datacenter)
+GDU_RETRY_WAIT   = 8.0       # espera antes de reintentar una página vacía
+GDU_RETRIES      = 2         # reintentos por página vacía antes de contarla como vacía
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
 
@@ -169,6 +179,37 @@ def _parse_gdu_page(html: str, chain: str, category: str) -> list[dict]:
     return products
 
 
+async def _fetch_gdu_page(
+    client: httpx.AsyncClient,
+    url: str,
+    chain: str,
+    cat_name: str,
+    page_num: int,
+    cat_slug: str,
+    base_url: str,
+) -> str | None:
+    """Descarga una página GDU con reintentos ante respuesta vacía."""
+    headers = {**HTML_HEADERS, "Referer": f"{base_url}/{cat_slug}"}
+    for attempt in range(1, GDU_RETRIES + 2):  # intento 1, 2, 3
+        try:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            # Verificar que la respuesta tiene productos antes de devolverla
+            if "product-item" in r.text:
+                return r.text
+            # Página llegó pero sin productos — esperar antes de reintentar
+            if attempt <= GDU_RETRIES:
+                log.debug(f"[{chain}][{cat_name}] p{page_num} sin productos (intento {attempt}), esperando {GDU_RETRY_WAIT}s...")
+                await asyncio.sleep(GDU_RETRY_WAIT)
+            else:
+                return r.text  # devolver igual en el último intento para que el caller decida
+        except Exception as e:
+            log.warning(f"[{chain}][{cat_name}] p{page_num} intento {attempt} error: {e}")
+            if attempt <= GDU_RETRIES:
+                await asyncio.sleep(GDU_RETRY_WAIT)
+    return None
+
+
 async def scrape_gdu_category(
     client: httpx.AsyncClient,
     chain: str,
@@ -182,17 +223,15 @@ async def scrape_gdu_category(
 
     for page_num in range(1, MAX_PAGES + 1):
         url = f"{base_url}/products/category/{cat_slug}/{page_num}"
-        try:
-            r = await client.get(url, headers={**HTML_HEADERS, "Referer": f"{base_url}/{cat_slug}"})
-            r.raise_for_status()
-        except Exception as e:
-            log.warning(f"[{chain}][{cat_name}] p{page_num} error: {e}")
+
+        html = await _fetch_gdu_page(client, url, chain, cat_name, page_num, cat_slug, base_url)
+        if html is None:
             consec_empty += 1
             if consec_empty >= MAX_CONSEC_EMPTY:
                 break
             continue
 
-        products = _parse_gdu_page(r.text, chain, cat_name)
+        products = _parse_gdu_page(html, chain, cat_name)
 
         new_in_page = 0
         for p in products:
@@ -211,7 +250,7 @@ async def scrape_gdu_category(
             consec_empty = 0
             log.info(f"[{chain}][{cat_name}] p{page_num}: +{new_in_page} (total={len(rows)})")
 
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(GDU_PAGE_DELAY)
 
     return rows
 
@@ -305,17 +344,26 @@ async def _tata_fetch_page(
         "selectedFacets": [{"key": "category-1", "value": cat_facet}],
     }
     payload = {"operationName": "ProductsQuery", "variables": variables, "query": TATA_QUERY}
-    try:
-        r = await client.post(TATA_URL, json=payload, headers=TATA_HEADERS)
-        r.raise_for_status()
-        data = r.json()
-        if "errors" in data:
-            log.warning(f"[tata] GraphQL errors: {data['errors']}")
-            return None
-        return data["data"]["search"]["products"]["edges"]
-    except Exception as e:
-        log.warning(f"[tata][{cat_facet}] after={after} error: {e}")
-        return None
+
+    for attempt in range(1, 4):  # hasta 3 intentos
+        try:
+            r = await client.post(TATA_URL, json=payload, headers=TATA_HEADERS)
+            if r.status_code == 500:
+                wait = attempt * 10.0
+                log.warning(f"[tata][{cat_facet}] after={after} 500, esperando {wait}s (intento {attempt}/3)")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if "errors" in data:
+                log.warning(f"[tata] GraphQL errors: {data['errors']}")
+                return None
+            return data["data"]["search"]["products"]["edges"]
+        except Exception as e:
+            wait = attempt * 5.0
+            log.warning(f"[tata][{cat_facet}] after={after} intento {attempt} error: {e}, esperando {wait}s")
+            await asyncio.sleep(wait)
+    return None
 
 
 def _tata_node_to_row(node: dict, category: str) -> dict | None:

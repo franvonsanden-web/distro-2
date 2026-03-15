@@ -1,13 +1,12 @@
 """
-scraper.py v3 — precios-uy
-- Async Playwright (más rápido)
-- Paginación real via ?page=N (no solo scroll)
-- TaTa FastStore: selector correcto
-- URLs de categorías corregidas con IDs reales
-- Tienda Inglesa: async requests
+scraper.py v4 — precios-uy
+Fixes vs v3:
+  1. Precio con overflow → validación + cap a $999,999
+  2. Tienda Inglesa loop infinito → stop cuando página repite los mismos hrefs
+  3. TaTa sku_id colapsado → mejor extracción desde href FastStore
 """
 
-import os, time, asyncio, logging, re
+import os, time, asyncio, logging, re, hashlib
 import httpx
 from datetime import datetime, timezone
 from playwright.async_api import async_playwright, Page
@@ -20,34 +19,33 @@ log = logging.getLogger(__name__)
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-# ── Categorías por cadena ─────────────────────────────────────────────────────
-# Disco / Devoto / Géant — URLs reales descubiertas via DOM del menú
-DISCO_CATEGORIES = [
-    ("almacen",             "almacen"),
-    ("frescos",             "frescos"),
-    ("bebidas",             "bebidas"),
-    ("congelados",          "products/category/congelados/6"),
-    ("limpieza",            "products/category/perfumeria-y-limpieza/12"),
-    ("mascotas",            "mascotas"),
-    ("bebes",               "products/category/bebes/100"),
-    ("hogar",               "hogar"),
-]
+# ── Precio máximo razonable en pesos uruguayos ────────────────────────────────
+MAX_PRICE = 999_999.0   # $999.999 UYU — cualquier cosa mayor es un error de parseo
 
-# Devoto y Géant comparten la misma estructura que Disco
+# ── Categorías ────────────────────────────────────────────────────────────────
+DISCO_CATEGORIES = [
+    ("almacen",    "almacen"),
+    ("frescos",    "frescos"),
+    ("bebidas",    "bebidas"),
+    ("congelados", "products/category/congelados/6"),
+    ("limpieza",   "products/category/perfumeria-y-limpieza/12"),
+    ("mascotas",   "mascotas"),
+    ("bebes",      "products/category/bebes/100"),
+    ("hogar",      "hogar"),
+]
 DEVOTO_CATEGORIES = DISCO_CATEGORIES
 GEANT_CATEGORIES  = DISCO_CATEGORIES
 
-# TaTa usa FastStore — slugs simples funcionan
 TATA_CATEGORIES = [
-    ("almacen",     "almacen"),
-    ("frescos",     "frescos"),
-    ("bebidas",     "bebidas"),
-    ("congelados",  "congelados"),
-    ("limpieza",    "limpieza"),
-    ("perfumeria",  "perfumeria"),
-    ("mascotas",    "mascotas"),
-    ("bebes",       "bebes"),
-    ("hogar",       "hogar"),
+    ("almacen",    "almacen"),
+    ("frescos",    "frescos"),
+    ("bebidas",    "bebidas"),
+    ("congelados", "congelados"),
+    ("limpieza",   "limpieza"),
+    ("perfumeria", "perfumeria"),
+    ("mascotas",   "mascotas"),
+    ("bebes",      "bebes"),
+    ("hogar",      "hogar"),
 ]
 
 VTEX_CHAINS = {
@@ -58,14 +56,10 @@ VTEX_CHAINS = {
 }
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
-MAX_PAGES   = 50     # límite de seguridad por categoría
-PAGE_WAIT   = 5000   # ms tras goto
-ITEM_WAIT   = 4000   # ms esperando selector
+MAX_PAGES  = 50
+PAGE_WAIT  = 5000
+ITEM_WAIT  = 4000
 
-
-# ── Selectores por tipo de stack ──────────────────────────────────────────────
-
-# VTEX IO (Disco, Devoto, Géant) — versión moderna
 VTEX_IO_SELECTORS = [
     "section.vtex-product-summary-2-x-container",
     "article[class*='vtex-product-summary']",
@@ -74,7 +68,6 @@ VTEX_IO_SELECTORS = [
     ".product-item",
 ]
 
-# VTEX FastStore (TaTa)
 FASTSTORE_SELECTORS = [
     "article[class*='product-card-module--fs-product-card']",
     "article[class*='fs-product-card']",
@@ -84,41 +77,60 @@ FASTSTORE_SELECTORS = [
 ]
 
 
-async def find_selector(page: Page, selectors: list[str], timeout: int = ITEM_WAIT) -> str | None:
-    """Devuelve el primer selector que matchea en la página."""
+# ── Precio parsing con validación ────────────────────────────────────────────
+
+def parse_price(raw: str) -> float | None:
+    """Convierte '$1.234,56' → 1234.56. Rechaza valores > MAX_PRICE."""
+    s = re.sub(r'[^0-9.,]', '', raw).strip()
+    if not s:
+        return None
+    if ',' in s and '.' in s:
+        # formato UY: 1.234,56
+        s = s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        s = s.replace(',', '.')
+    elif s.count('.') > 1:
+        # 1.234.567 → miles sin decimales
+        s = s.replace('.', '')
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    if v <= 0 or v > MAX_PRICE:
+        return None   # FIX: descarta precios inválidos / overflow
+    return v
+
+
+# ── VTEX Playwright ───────────────────────────────────────────────────────────
+
+async def find_selector(page: Page, selectors: list, timeout: int = ITEM_WAIT) -> str | None:
     for sel in selectors:
         try:
             await page.wait_for_selector(sel, timeout=timeout)
-            count = await page.locator(sel).count()
-            if count > 0:
+            if await page.locator(sel).count() > 0:
                 return sel
         except:
             continue
     return None
 
 
-async def extract_products(page: Page, selector: str, chain: str, cat: str) -> list[dict]:
-    """Extrae productos de la página actual usando el selector detectado."""
-    return await page.evaluate("""([sel, chain, cat]) => {
+async def extract_products(page: Page, selector: str) -> list[dict]:
+    return await page.evaluate("""(sel) => {
         const cards = document.querySelectorAll(sel);
         const results = [];
-
         cards.forEach(card => {
-            // ── Nombre ──
             const nameEl =
                 card.querySelector('[class*="productName"]') ||
                 card.querySelector('[class*="product-name"]') ||
                 card.querySelector('[class*="fs-product-card__title"]') ||
                 card.querySelector('[class*="ProductCard_title"]') ||
+                card.querySelector('[class*="title"]') ||
                 card.querySelector('h3') || card.querySelector('h2') ||
                 card.querySelector('a[title]');
-            
-            let name = nameEl
-                ? (nameEl.title || nameEl.innerText || '').trim()
-                : '';
-            if (!name && nameEl) name = nameEl.getAttribute('title') || '';
 
-            // ── Precio ──
+            let name = '';
+            if (nameEl) name = (nameEl.title || nameEl.innerText || '').trim();
+
             const priceEl =
                 card.querySelector('[class*="sellingPriceValue"]') ||
                 card.querySelector('[class*="sellingPrice"]') ||
@@ -126,44 +138,49 @@ async def extract_products(page: Page, selector: str, chain: str, cat: str) -> l
                 card.querySelector('[class*="price__selling"]') ||
                 card.querySelector('[class*="fs-price"]') ||
                 card.querySelector('[class*="Price_selling"]') ||
+                card.querySelector('[class*="bestPrice"]') ||
                 card.querySelector('[class*="price"]');
-            
+
             const priceRaw = priceEl ? priceEl.innerText.trim() : '';
 
-            // ── Imagen ──
             const imgEl =
                 card.querySelector('img[class*="image"]') ||
                 card.querySelector('img[class*="Image"]') ||
                 card.querySelector('img');
             const img = imgEl ? (imgEl.src || imgEl.dataset?.src || '') : '';
 
-            // ── Link / SKU ──
-            const linkEl = card.querySelector('a[href]');
-            const href   = linkEl ? linkEl.href : '';
+            // FIX TaTa: recoger TODOS los hrefs de la card, no solo el primero
+            const links = Array.from(card.querySelectorAll('a[href]'))
+                .map(a => a.href)
+                .filter(h => h && !h.includes('javascript'));
+            const href = links.find(h => h.includes('/p') || h.length > 30) || links[0] || '';
 
             if (name && priceRaw) {
                 results.push({ name, price_raw: priceRaw, image_url: img, href });
             }
         });
-
         return results;
-    }""", [selector, chain, cat])
+    }""", selector)
 
 
-def parse_price(raw: str) -> float | None:
-    """Convierte '$1.234,56' o '$ 1234' a float."""
-    s = re.sub(r'[^0-9.,]', '', raw).strip()
-    # Formato uruguayo: punto=miles, coma=decimal
-    if ',' in s and '.' in s:
-        s = s.replace('.', '').replace(',', '.')
-    elif ',' in s:
-        s = s.replace(',', '.')
-    elif s.count('.') > 1:
-        s = s.replace('.', '')
-    try:
-        return float(s)
-    except:
-        return None
+def make_sku_id(name: str, href: str, chain: str) -> str:
+    """
+    Genera un sku_id robusto.
+    Prioriza el slug del href. Fallback: hash del nombre.
+    FIX TaTa: FastStore usa URLs tipo /almacen/arroz-gallo-1kg-123456/p
+    """
+    if href:
+        # Extraer slug: último segmento antes de /p o ?
+        path = href.rstrip('/').split('?')[0]
+        segments = [s for s in path.split('/') if s]
+        if segments:
+            slug = segments[-1]
+            if slug == 'p' and len(segments) > 1:
+                slug = segments[-2]
+            if len(slug) > 3:
+                return slug[:120]
+    # Fallback: hash determinístico del nombre+cadena
+    return hashlib.md5(f"{chain}:{name}".encode()).hexdigest()[:20]
 
 
 async def scrape_category(
@@ -172,38 +189,35 @@ async def scrape_category(
     chain: str,
     cat_name: str,
     cat_slug: str,
-    selectors: list[str],
+    selectors: list,
 ) -> list[dict]:
-    """Scrapea todas las páginas de una categoría con paginación ?page=N."""
     rows      = []
     seen_skus = set()
 
     for page_num in range(1, MAX_PAGES + 1):
-        url = f"{base_url}/{cat_slug}{'?page=' + str(page_num) if page_num > 1 else ''}"
+        sep = "?" if "?" not in cat_slug else "&"
+        url = f"{base_url}/{cat_slug}{sep + 'page=' + str(page_num) if page_num > 1 else ''}"
         log.info(f"[{chain}][{cat_name}] p{page_num} → {url}")
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(PAGE_WAIT)
-
-            # Scroll para trigger lazy load
             for _ in range(3):
                 await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(700)
         except Exception as e:
             log.warning(f"[{chain}][{cat_name}] Error navegando p{page_num}: {e}")
             break
 
-        # Detectar selector
         sel = await find_selector(page, selectors)
         if not sel:
             if page_num == 1:
-                log.warning(f"[{chain}][{cat_name}] Sin productos en p1 — skip categoría")
+                log.warning(f"[{chain}][{cat_name}] Sin productos en p1 — skip")
             else:
                 log.info(f"[{chain}][{cat_name}] Sin más productos en p{page_num} — fin")
             break
 
-        products = await extract_products(page, sel, chain, cat_name)
+        products = await extract_products(page, sel)
         if not products:
             log.info(f"[{chain}][{cat_name}] 0 productos en p{page_num} — fin")
             break
@@ -214,8 +228,7 @@ async def scrape_category(
             if price is None:
                 continue
 
-            href   = p.get("href", "")
-            sku_id = href.rstrip("/").split("/")[-1].split("?")[0] or p["name"][:50]
+            sku_id = make_sku_id(p["name"], p.get("href", ""), chain)
 
             if sku_id in seen_skus:
                 continue
@@ -239,7 +252,6 @@ async def scrape_category(
 
         log.info(f"[{chain}][{cat_name}] p{page_num}: {new_in_page} nuevos / {len(products)} vistos / total={len(rows)}")
 
-        # Si la página trajo 0 productos nuevos (duplicados) → fin de paginación
         if new_in_page == 0:
             log.info(f"[{chain}][{cat_name}] Solo duplicados en p{page_num} — fin")
             break
@@ -250,11 +262,9 @@ async def scrape_category(
 
 
 async def scrape_vtex_chain(chain: str, base_url: str, categories: list) -> list[dict]:
-    """Lanza el browser y scrapea todas las categorías de una cadena."""
-    all_rows = []
+    all_rows  = []
     selectors = FASTSTORE_SELECTORS if chain == "tata" else VTEX_IO_SELECTORS
-
-    log.info(f"[{chain}] Iniciando (async Playwright)")
+    log.info(f"[{chain}] Iniciando")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -269,12 +279,11 @@ async def scrape_vtex_chain(chain: str, base_url: str, categories: list) -> list
         for cat_name, cat_slug in categories:
             rows = await scrape_category(page, base_url, chain, cat_name, cat_slug, selectors)
             all_rows.extend(rows)
-            log.info(f"[{chain}][{cat_name}] ✓ {len(rows)} productos — acumulado: {len(all_rows)}")
+            log.info(f"[{chain}][{cat_name}] ✓ {len(rows)} — acumulado: {len(all_rows)}")
             await asyncio.sleep(0.5)
 
         await browser.close()
 
-    # Deduplicar globalmente
     seen = {}
     for r in all_rows:
         seen[r["sku_id"]] = r
@@ -283,7 +292,7 @@ async def scrape_vtex_chain(chain: str, base_url: str, categories: list) -> list
     return unique
 
 
-# ── Tienda Inglesa (httpx async) ──────────────────────────────────────────────
+# ── Tienda Inglesa ────────────────────────────────────────────────────────────
 
 TI_CATEGORIES = [
     ("almacen",    78),
@@ -310,10 +319,12 @@ async def scrape_tienda_inglesa() -> list[dict]:
 
     async with httpx.AsyncClient(headers=TI_HEADERS, timeout=20, follow_redirects=True) as client:
         for cat_name, cat_id in TI_CATEGORIES:
-            page_num = 0
-            empty    = 0
+            page_num      = 0
+            consecutive_empty = 0
+            seen_hrefs    = set()   # FIX: detectar loop infinito por hrefs repetidos
+            MAX_TI_PAGES  = 200     # límite duro por categoría
 
-            while empty < 2:
+            while consecutive_empty < 2 and page_num < MAX_TI_PAGES:
                 url = (
                     f"https://www.tiendainglesa.com.uy/supermercado/categoria"
                     f"/{cat_name}/busqueda?0,0,*:*,{cat_id},0,0,,,false,,,,{page_num}"
@@ -330,6 +341,13 @@ async def scrape_tienda_inglesa() -> list[dict]:
 
                 soup  = BeautifulSoup(r.text, "lxml")
                 cards = soup.select("a[href*='.producto']")[:40]
+
+                # FIX: detectar si la página devuelve los mismos hrefs que antes
+                page_hrefs = frozenset(c.get("href","") for c in cards)
+                if page_hrefs and page_hrefs.issubset(seen_hrefs):
+                    log.info(f"[{chain}][{cat_name}] Hrefs repetidos en p{page_num} — fin real")
+                    break
+                seen_hrefs.update(page_hrefs)
 
                 found = 0
                 for card in cards:
@@ -367,7 +385,7 @@ async def scrape_tienda_inglesa() -> list[dict]:
                     found += 1
 
                 log.info(f"[{chain}][{cat_name}] p{page_num}: {found} productos (total={len(rows)})")
-                empty = 0 if found > 0 else empty + 1
+                consecutive_empty = 0 if found > 0 else consecutive_empty + 1
                 page_num += 1
                 await asyncio.sleep(0.35)
 
@@ -375,9 +393,9 @@ async def scrape_tienda_inglesa() -> list[dict]:
     return rows
 
 
-# ── Supabase upsert ───────────────────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────────────────────
 
-def upsert_prices(sb: Client, rows: list[dict], chain: str) -> dict:
+def upsert_prices(sb: Client, rows: list, chain: str) -> dict:
     if not rows:
         return {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 0}
 
@@ -405,7 +423,8 @@ def upsert_prices(sb: Client, rows: list[dict], chain: str) -> dict:
                 price_changes.append({
                     "chain": row["chain"], "sku_id": row["sku_id"],
                     "name": row["name"], "old_price": old,
-                    "new_price": row["price"], "pct_change": round(pct, 2),
+                    "new_price": row["price"],
+                    "pct_change": max(-9999.99, min(9999.99, round(pct, 2))),
                     "detected_at": datetime.now(timezone.utc).isoformat(),
                 })
             else:
@@ -421,14 +440,13 @@ def upsert_prices(sb: Client, rows: list[dict], chain: str) -> dict:
     if price_changes:
         try:
             sb.table("price_changes").insert(price_changes).execute()
-            log.info(f"[{chain}] {len(price_changes)} cambios de precio")
         except Exception as e:
             log.warning(f"Error price_changes: {e}")
 
     return stats
 
 
-def log_run(sb: Client, chain: str, run_start: datetime, rows: list, stats: dict, elapsed: float):
+def log_run(sb, chain, run_start, rows, stats, elapsed):
     try:
         sb.table("scrape_logs").insert({
             "chain": chain, "run_at": run_start.isoformat(),
@@ -438,41 +456,38 @@ def log_run(sb: Client, chain: str, run_start: datetime, rows: list, stats: dict
             "status": "ok" if stats["errors"] == 0 else "partial",
         }).execute()
     except Exception as e:
-        log.error(f"Error guardando log {chain}: {e}")
+        log.error(f"Error log {chain}: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main_async():
-    log.info("=" * 60 + " precios-uy v3")
+    log.info("=" * 60 + " precios-uy v4")
     sb        = create_client(SUPABASE_URL, SUPABASE_KEY)
     run_start = datetime.now(timezone.utc)
 
-    # VTEX chains — secuencial para evitar rate-limit
     for chain, (base_url, categories) in VTEX_CHAINS.items():
         t0 = time.time()
         try:
             rows  = await scrape_vtex_chain(chain, base_url, categories)
             stats = upsert_prices(sb, rows, chain)
         except Exception as e:
-            log.error(f"[{chain}] FALLO TOTAL: {e}")
+            log.error(f"[{chain}] FALLO: {e}")
             rows, stats = [], {"inserted":0,"updated":0,"unchanged":0,"errors":1}
         elapsed = round(time.time() - t0, 1)
         log_run(sb, chain, run_start, rows, stats, elapsed)
         log.info(f"[{chain}] scraped={len(rows)} new={stats['inserted']} updated={stats['updated']} ({elapsed}s)")
 
-    # Tienda Inglesa
     t0 = time.time()
     try:
         rows  = await scrape_tienda_inglesa()
         stats = upsert_prices(sb, rows, "tienda_inglesa")
     except Exception as e:
-        log.error(f"[tienda_inglesa] FALLO TOTAL: {e}")
+        log.error(f"[tienda_inglesa] FALLO: {e}")
         rows, stats = [], {"inserted":0,"updated":0,"unchanged":0,"errors":1}
     elapsed = round(time.time() - t0, 1)
     log_run(sb, "tienda_inglesa", run_start, rows, stats, elapsed)
     log.info(f"[tienda_inglesa] scraped={len(rows)} new={stats['inserted']} ({elapsed}s)")
-
     log.info("=" * 60 + " FIN")
 
 

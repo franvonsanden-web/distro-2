@@ -10,6 +10,12 @@ from datetime import datetime, timezone
 from supabase import create_client, Client
 from bs4 import BeautifulSoup
 
+from dotenv import load_dotenv
+load_dotenv()
+
+
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 

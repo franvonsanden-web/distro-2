@@ -294,15 +294,17 @@ async def scrape_vtex_chain(chain: str, base_url: str, categories: list) -> list
 
 # ── Tienda Inglesa ────────────────────────────────────────────────────────────
 
+# Términos de búsqueda por categoría para TI (las URLs con ID solo funcionan en almacén)
+TI_SEARCH_TERMS = [
+    ("bebidas",    ["agua mineral", "jugo", "refresco", "cerveza", "vino", "gaseosa"]),
+    ("lacteos",    ["leche", "queso", "yogur", "manteca", "crema de leche"]),
+    ("limpieza",   ["detergente", "lavandina", "jabon loza", "suavizante", "desengrasante"]),
+    ("perfumeria", ["shampoo", "desodorante", "jabon liquido", "crema corporal", "pasta dental"]),
+    ("congelados", ["helado", "pizza congelada", "empanada congelada", "milanesa congelada"]),
+]
+
 TI_CATEGORIES = [
-    ("almacen",    78),
-    ("bebidas",    79),
-    ("lacteos",    80),
-    ("carnes",     81),
-    ("verduleria", 82),
-    ("limpieza",   83),
-    ("perfumeria", 84),
-    ("congelados", 85),
+    ("almacen", 78),   # único que funciona con paginación directa
 ]
 
 TI_HEADERS = {
@@ -312,87 +314,111 @@ TI_HEADERS = {
 }
 
 
+async def _parse_ti_card(card, cat_name: str, chain: str) -> dict | None:
+    """Parsea una card HTML de Tienda Inglesa."""
+    name_el = card.select_one("span, div")
+    name = name_el.get_text(strip=True) if name_el else card.get_text(" ", strip=True)
+    if not name or len(name) < 3:
+        return None
+    price_el = card.find(string=lambda t: t and "$" in t)
+    if not price_el:
+        for sib in card.next_siblings:
+            txt = getattr(sib, "get_text", lambda **k: "")()
+            if "$" in txt:
+                price_el = txt
+                break
+    if not price_el:
+        return None
+    price = parse_price(str(price_el))
+    if price is None:
+        return None
+    href = card.get("href", "")
+    prod_id = href.split("?")[-1].split(",")[0] if "?" in href else name[:50]
+    return {
+        "ean": None, "chain": chain, "product_id": prod_id, "sku_id": prod_id,
+        "name": name[:200], "brand": "", "category": cat_name, "image_url": "",
+        "price": price, "list_price": price, "available": True,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 async def scrape_tienda_inglesa() -> list[dict]:
+    """
+    TI v2: almacén via paginación directa + otras categorías via búsqueda por términos.
+    """
     chain = "tienda_inglesa"
     rows  = []
-    log.info(f"[{chain}] Iniciando")
+    seen_ids: set = set()
+    log.info(f"[{chain}] Iniciando v2")
 
     async with httpx.AsyncClient(headers=TI_HEADERS, timeout=20, follow_redirects=True) as client:
-        for cat_name, cat_id in TI_CATEGORIES:
-            page_num      = 0
-            consecutive_empty = 0
-            seen_hrefs    = set()   # FIX: detectar loop infinito por hrefs repetidos
-            MAX_TI_PAGES  = 200     # límite duro por categoría
 
-            while consecutive_empty < 2 and page_num < MAX_TI_PAGES:
-                url = (
-                    f"https://www.tiendainglesa.com.uy/supermercado/categoria"
-                    f"/{cat_name}/busqueda?0,0,*:*,{cat_id},0,0,,,false,,,,{page_num}"
-                )
-                try:
-                    r = await client.get(url)
-                    if r.status_code == 403:
-                        log.warning(f"[{chain}][{cat_name}] 403 — stop")
-                        break
-                    r.raise_for_status()
-                except Exception as e:
-                    log.warning(f"[{chain}][{cat_name}] Error p{page_num}: {e}")
-                    break
+        # ── Almacén: paginación directa (ID 78 funciona) ──
+        page_num, consec_empty, seen_hrefs = 0, 0, set()
+        while consec_empty < 2 and page_num < 200:
+            url = (f"https://www.tiendainglesa.com.uy/supermercado/categoria"
+                   f"/almacen/busqueda?0,0,*:*,78,0,0,,,false,,,,{page_num}")
+            try:
+                r = await client.get(url)
+                if r.status_code == 403: break
+                r.raise_for_status()
+            except Exception as e:
+                log.warning(f"[{chain}][almacen] p{page_num}: {e}"); break
 
-                soup  = BeautifulSoup(r.text, "lxml")
-                cards = soup.select("a[href*='.producto']")[:40]
+            soup  = BeautifulSoup(r.text, "lxml")
+            cards = soup.select("a[href*='.producto']")[:40]
+            hrefs = frozenset(c.get("href","") for c in cards)
+            if hrefs and hrefs.issubset(seen_hrefs):
+                log.info(f"[{chain}][almacen] Hrefs repetidos en p{page_num} — fin")
+                break
+            seen_hrefs.update(hrefs)
 
-                # FIX: detectar si la página devuelve los mismos hrefs que antes
-                page_hrefs = frozenset(c.get("href","") for c in cards)
-                if page_hrefs and page_hrefs.issubset(seen_hrefs):
-                    log.info(f"[{chain}][{cat_name}] Hrefs repetidos en p{page_num} — fin real")
-                    break
-                seen_hrefs.update(page_hrefs)
-
-                found = 0
-                for card in cards:
-                    name_el = card.select_one("span, div")
-                    name    = name_el.get_text(strip=True) if name_el else card.get_text(" ", strip=True)
-                    if not name or len(name) < 3:
-                        continue
-
-                    price_el = card.find(string=lambda t: t and "$" in t)
-                    if not price_el:
-                        for sib in card.next_siblings:
-                            txt = getattr(sib, "get_text", lambda **k: "")()
-                            if "$" in txt:
-                                price_el = txt
-                                break
-                    if not price_el:
-                        continue
-
-                    price = parse_price(str(price_el))
-                    if price is None:
-                        continue
-
-                    href    = card.get("href", "")
-                    prod_id = href.split("?")[-1].split(",")[0] if "?" in href else name[:50]
-
-                    rows.append({
-                        "ean": None, "chain": chain,
-                        "product_id": prod_id, "sku_id": prod_id,
-                        "name": name[:200], "brand": "",
-                        "category": cat_name, "image_url": "",
-                        "price": price, "list_price": price,
-                        "available": True,
-                        "scraped_at": datetime.now(timezone.utc).isoformat(),
-                    })
+            found = 0
+            for card in cards:
+                prod = await _parse_ti_card(card, "almacen", chain)
+                if prod and prod["sku_id"] not in seen_ids:
+                    seen_ids.add(prod["sku_id"])
+                    rows.append(prod)
                     found += 1
+            log.info(f"[{chain}][almacen] p{page_num}: {found} (total={len(rows)})")
+            consec_empty = 0 if found > 0 else consec_empty + 1
+            page_num += 1
+            await asyncio.sleep(0.35)
 
-                log.info(f"[{chain}][{cat_name}] p{page_num}: {found} productos (total={len(rows)})")
-                consecutive_empty = 0 if found > 0 else consecutive_empty + 1
-                page_num += 1
-                await asyncio.sleep(0.35)
+        # ── Otras categorías: búsqueda por términos ──
+        for cat_name, terms in TI_SEARCH_TERMS:
+            cat_found = 0
+            for term in terms:
+                encoded = term.replace(" ", "+")
+                for pg in range(0, 15):
+                    url = (f"https://www.tiendainglesa.com.uy/supermercado/busqueda"
+                           f"?0,0,{encoded},0,0,0,,,false,,,{pg}")
+                    try:
+                        r = await client.get(url)
+                        if r.status_code in (403, 404): break
+                        r.raise_for_status()
+                    except Exception as e:
+                        log.warning(f"[{chain}][{cat_name}][{term}] p{pg}: {e}"); break
+
+                    soup  = BeautifulSoup(r.text, "lxml")
+                    cards = soup.select("a[href*='.producto']")[:40]
+                    if not cards: break
+
+                    found = 0
+                    for card in cards:
+                        prod = await _parse_ti_card(card, cat_name, chain)
+                        if prod and prod["sku_id"] not in seen_ids:
+                            seen_ids.add(prod["sku_id"])
+                            rows.append(prod)
+                            found += 1
+                            cat_found += 1
+                    if found == 0: break
+                    await asyncio.sleep(0.3)
+
+            log.info(f"[{chain}][{cat_name}] via búsqueda: {cat_found} productos")
 
     log.info(f"[{chain}] Total: {len(rows)}")
     return rows
-
-
 # ── Supabase ──────────────────────────────────────────────────────────────────
 
 def upsert_prices(sb: Client, rows: list, chain: str) -> dict:
@@ -411,8 +437,14 @@ def upsert_prices(sb: Client, rows: list, chain: str) -> dict:
     price_changes = []
     BATCH = 500
 
-    for i in range(0, len(rows), BATCH):
-        batch = rows[i : i + BATCH]
+    # Deduplicar por sku_id dentro del mismo envío (evita ON CONFLICT error)
+    deduped_map: dict = {}
+    for row in rows:
+        deduped_map[row["sku_id"]] = row
+    deduped = list(deduped_map.values())
+
+    for i in range(0, len(deduped), BATCH):
+        batch = deduped[i : i + BATCH]
         for row in batch:
             old = existing.get(row["sku_id"])
             if old is None:

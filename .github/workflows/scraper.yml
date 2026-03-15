@@ -8,7 +8,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +21,6 @@ jobs:
 
       - name: Instalar dependencias Python
         run: pip install -r scraper/requirements.txt
-
-      - name: Instalar browser Playwright
-        run: playwright install chromium --with-deps
 
       - name: Correr scraper
         env:

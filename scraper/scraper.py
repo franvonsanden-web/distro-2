@@ -128,131 +128,112 @@ def export_rows(chain: str, rows: list[dict]) -> None:
     log.info("[%s] Exportado JSON local: %s", chain, path)
 
 
-# ───────────────────────── VTEX ─────────────────────────
+# ───────────────────────── VTEX (Playwright) ─────────────────────────
+from playwright.sync_api import sync_playwright
+import re
 
-def flatten_category_ids(nodes: Iterable[dict]) -> list[int]:
-    ids: list[int] = []
-    for node in nodes or []:
-        try:
-            ids.append(int(node["id"]))
-        except Exception:
-            continue
-        ids.extend(flatten_category_ids(node.get("children") or []))
-    return ids
+VTEX_CATEGORIES = [
+    'almacen', 'frescos', 'bebidas', 'congelados', 'limpieza', 'perfumeria', 'mascotas', 'bebes', 'hogar'
+]
 
-
-def fetch_vtex_category_ids(session: requests.Session, base: str) -> list[int]:
-    url = f"{base}/api/catalog_system/pub/category/tree/10"
-    r = session.get(url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    ids = sorted(set(flatten_category_ids(data if isinstance(data, list) else [])))
-    if not ids:
-        raise RuntimeError(f"No se pudieron resolver categorías VTEX para {base}")
-    return ids
-
-
-def vtex_search_page(session: requests.Session, base: str, cat_id: int, from_: int) -> list[dict]:
-    url = (
-        f"{base}/api/catalog_system/pub/products/search/"
-        f"?fq=C%3A%2F{cat_id}%2F"
-        f"&_from={from_}&_to={from_ + PAGE_SIZE - 1}"
-        f"&O=OrderByTopSaleDESC"
-    )
-    r = session.get(url, timeout=REQUEST_TIMEOUT)
-    if r.status_code in (400, 404):
-        return []
-    r.raise_for_status()
-    data = r.json()
-    return data if isinstance(data, list) else []
-
-
-def parse_vtex_product(product: dict, chain: str) -> list[dict]:
-    rows: list[dict] = []
-    categories = product.get("categories") or [""]
-    category = categories[0].strip("/").split("/")[-1] if categories else ""
-
-    for item in product.get("items") or []:
-        sellers = item.get("sellers") or []
-        if not sellers:
-            continue
-
-        seller0 = sellers[0] or {}
-        offer = seller0.get("commertialOffer") or seller0.get("commercialOffer") or {}
-        price = offer.get("Price")
-        sku_id = str(item.get("itemId") or "").strip()
-        if price is None or not sku_id:
-            continue
-
-        reference_ids = item.get("referenceId") or []
-        ean = item.get("ean") or next(
-            (ref.get("Value") for ref in reference_ids if ref.get("Key") in {"RefId", "EAN"}),
-            None,
-        )
-
-        rows.append(
-            {
-                "ean": ean,
-                "chain": chain,
-                "product_id": str(product.get("productId") or ""),
-                "sku_id": sku_id,
-                "name": product.get("productName") or "",
-                "brand": product.get("brand") or "",
-                "category": category,
-                "image_url": ((item.get("images") or [{}])[0] or {}).get("imageUrl", ""),
-                "price": float(price),
-                "list_price": float(offer.get("ListPrice") or price),
-                "available": bool((offer.get("AvailableQuantity") or 0) > 0),
-                "scraped_at": utc_now_iso(),
-            }
-        )
-    return rows
-
-
-def scrape_vtex_chain(chain: str, cfg: dict, session: requests.Session) -> list[dict]:
-    base = cfg["base"]
+def scrape_vtex_playwright(chain: str, cfg: dict) -> list[dict]:
+    base = cfg['base']
     all_rows: dict[str, dict] = {}
-    category_ids = fetch_vtex_category_ids(session, base)
-
-    log.info("[%s] Iniciando VTEX con %s categorías detectadas", chain, len(category_ids))
-
-    for cat_id in category_ids:
-        page = 0
-        while True:
-            try:
-                products = vtex_search_page(session, base, cat_id, page * PAGE_SIZE)
-            except Exception as exc:
-                log.warning("[%s][cat=%s] Error página %s: %s", chain, cat_id, page, exc)
-                break
-
-            if not products:
-                break
-
-            before = len(all_rows)
-            for product in products:
-                for row in parse_vtex_product(product, chain):
-                    all_rows[row["sku_id"]] = row
-
-            log.info(
-                "[%s][cat=%s] p%s: products=%s unique_delta=%s total=%s",
-                chain,
-                cat_id,
-                page,
-                len(products),
-                len(all_rows) - before,
-                len(all_rows),
+    
+    log.info('[%s] Iniciando Playwright VTEX', chain)
+    
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0"
             )
-
-            page += 1
-            if len(products) < PAGE_SIZE:
-                break
-            maybe_sleep()
-
+            page = context.new_page()
+            
+            for cat in VTEX_CATEGORIES:
+                url = f"{base}/{cat}"
+                log.info('[%s] Cargando %s', chain, url)
+                
+                try:
+                    page.goto(url, timeout=60000)
+                    # Esperar a que Blazor cargue el DOM
+                    page.wait_for_selector('.product-item', timeout=20000)
+                except Exception as e:
+                    log.warning('[%s] Timeout o error en %s: %s', chain, cat, e)
+                    continue
+                
+                # Scroll para cargar perezosamente más items
+                for _ in range(5):
+                    page.evaluate('window.scrollBy(0, document.body.scrollHeight)')
+                    page.wait_for_timeout(2000)
+                    
+                products = page.evaluate(r"""() => {
+                    const els = document.querySelectorAll('.product-item');
+                    return Array.from(els).map(el => {
+                        const nameNode = el.querySelector('.prod-desc');
+                        const priceNode = el.querySelector('.price .val');
+                        const imgNode = el.querySelector('img');
+                        const linkNode = el.querySelector('a');
+                        
+                        let name = '';
+                        if (nameNode) {
+                            name = nameNode.innerText.split('Agregar')[0].split('\n').join(' ').trim();
+                        }
+                        return {
+                            name: name,
+                            price_text: priceNode ? priceNode.innerText.trim() : '',
+                            link: linkNode ? linkNode.href : '',
+                            image_url: imgNode ? imgNode.src : ''
+                        };
+                    });
+                }""")
+                
+                before = len(all_rows)
+                for raw in products:
+                    name = raw['name']
+                    price_text = raw['price_text']
+                    if not name or not price_text:
+                        continue
+                    
+                    try:
+                        price = float(price_text.replace('.', '').replace(',', '.'))
+                    except ValueError:
+                        continue
+                        
+                    href = raw['link'] or ''
+                    # Extract ID from end of URL
+                    sku_match = re.search(r'/(\d+)$', href)
+                    sku_id = sku_match.group(1) if sku_match else href.split('/')[-1]
+                    if not sku_id:
+                        continue
+                        
+                    row = {
+                        'ean': sku_id, # Usamos el ID interno como EAN temporal
+                        'chain': chain,
+                        'product_id': sku_id,
+                        'sku_id': sku_id,
+                        'name': name,
+                        'brand': '',
+                        'category': cat,
+                        'image_url': raw['image_url'],
+                        'price': price,
+                        'list_price': price,
+                        'available': True,
+                        'scraped_at': utc_now_iso(),
+                    }
+                    all_rows[sku_id] = row
+                    
+                log.info('[%s][cat=%s] products=%s new=%s total=%s', chain, cat, len(products), len(all_rows) - before, len(all_rows))
+                maybe_sleep()
+                
+            browser.close()
+    except Exception as e:
+        log.error("[%s] Error global en scrape_vtex_playwright: %s", chain, e)
+        
     result = list(all_rows.values())
-    log.info("[%s] Total productos únicos: %s", chain, len(result))
+    log.info('[%s] Total productos unicos: %s', chain, len(result))
     export_rows(chain, result)
     return result
-
 
 # ─────────────────────── Tienda Inglesa ───────────────────────
 
@@ -519,7 +500,7 @@ def main() -> None:
     for chain, (kind, cfg) in jobs.items():
         t0 = time.time()
         try:
-            rows = scrape_vtex_chain(chain, cfg, session) if kind == "vtex" else scrape_tienda_inglesa(session)
+            rows = scrape_vtex_playwright(chain, cfg) if kind == "vtex" else scrape_tienda_inglesa(session)
             stats = upsert_prices(supabase, rows, chain)
             status = "ok" if stats["errors"] == 0 else "partial"
         except Exception as exc:

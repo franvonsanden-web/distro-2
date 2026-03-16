@@ -53,6 +53,299 @@ JSON_HEADERS = {
 }
 
 
+# ── VTEX API Configuration ───────────────────────────────────────────────────
+
+# Many Uruguayan supermarket chains run on the VTEX e‑commerce platform.  VTEX
+# exposes an unauthenticated, public API for its catalogue and checkout logic
+# which returns well structured JSON, including the EAN barcode for each
+# product, brand information, image URLs and both regular and promotional
+# prices.  Leveraging this API yields significantly more data than scraping
+# HTML pages and is dramatically faster because we avoid parsing full page
+# layouts.  See analisis_scraping_supermercados_uy.html for more details.
+
+# Map each chain to its VTEX base domain.  When adding support for new VTEX
+# chains simply add an entry here.  The scraper will automatically build
+# API endpoints from these domains.
+VTEX_CHAINS: dict[str, str] = {
+    "disco":  "disco.com.uy",
+    "devoto": "devoto.com.uy",
+    "geant":  "geant.com.uy",
+    "tata":   "tata.com.uy",
+}
+
+# Maximum number of items returned per search request.  VTEX accepts values up
+# to ~50.  Using the maximum reduces the number of HTTP requests required to
+# enumerate large categories, improving throughput dramatically.  Adjust if
+# servers begin throttling.
+VTEX_PAGE_SIZE = 50
+
+
+async def vtex_list_categories(client: httpx.AsyncClient, base_url: str) -> list[dict]:
+    """List all third‑level categories from the VTEX catalogue tree.
+
+    The endpoint `/api/catalog_system/pub/category/tree/3` returns a nested
+    structure of categories.  Each entry has the keys `id`, `name` and
+    potentially a `children` array.  Only the leaf categories (no further
+    children) are scraped because they hold actual products.  Returns a list
+    of objects with `id` and `name`.
+
+    Args:
+        client: an `httpx.AsyncClient` instance.
+        base_url: e.g. "disco.com.uy".  Do not include protocol or trailing
+            slash.  The function will prepend `https://`.
+
+    Returns:
+        A list of dictionaries with keys `id` (int) and `name` (str).
+    """
+    url = f"https://{base_url}/api/catalog_system/pub/category/tree/3"
+    try:
+        r = await client.get(url, headers=JSON_HEADERS, timeout=30)
+        r.raise_for_status()
+        data = r.json()  # expected to be a list
+    except Exception as e:
+        log.error(f"[vtex][{base_url}] Error listing categories: {e}")
+        return []
+
+    categories: list[dict] = []
+
+    def collect(leaves: list[dict]):
+        for c in leaves:
+            # If the category has children then recurse, otherwise collect it
+            if c.get("children"):
+                collect(c["children"])
+            else:
+                cid = c.get("id")
+                name = c.get("name") or c.get("Title")
+                if cid is not None and name:
+                    categories.append({"id": cid, "name": name})
+
+    if isinstance(data, list):
+        collect(data)
+
+    # Deduplicate by id
+    uniq = {}
+    for cat in categories:
+        uniq[cat["id"]] = cat
+    return list(uniq.values())
+
+
+async def vtex_fetch_category_products(client: httpx.AsyncClient, base_url: str, category_id: int) -> list[dict]:
+    """Fetch all products within a VTEX category.
+
+    VTEX exposes a search endpoint that accepts a category filter via the
+    `fq=C:{category_id}` query parameter.  Pagination is controlled by the
+    `_from` and `_to` parameters, which are zero‑based inclusive indexes.
+    Example: `_from=0&_to=49` returns the first `50` products.  We loop until
+    an empty response is returned.
+
+    The response is a JSON array of products.  Each product contains basic
+    information (`productId`, `productName`, `brand`, etc.) and one or more
+    items (variants) under the `items` field.  Each item has an `itemId`
+    (this is the SKU), an `images` list and an array of `sellers` which
+    includes `commertialOffer` objects containing `Price` and `ListPrice`.
+
+    Args:
+        client: an `httpx.AsyncClient` instance.
+        base_url: e.g. "disco.com.uy".
+        category_id: the integer id of the category obtained from
+            `vtex_list_categories`.
+
+    Returns:
+        A list of dictionaries with basic product and SKU information.  Price
+        and stock are not included here; they are fetched separately by
+        `vtex_fetch_prices`.
+    """
+    products: list[dict] = []
+    start = 0
+    while True:
+        end = start + VTEX_PAGE_SIZE - 1
+        url = (
+            f"https://{base_url}/api/catalog_system/pub/products/search/"
+            f"?fq=C:{category_id}&_from={start}&_to={end}"
+        )
+        try:
+            r = await client.get(url, headers=JSON_HEADERS, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            log.warning(f"[vtex][{base_url}] cat {category_id} range {start}-{end}: {e}")
+            break
+        if not data:
+            break
+        for prod in data:
+            prod_id = prod.get("productId")
+            name = prod.get("productName") or prod.get("productNameComplete")
+            brand = prod.get("brand") or prod.get("brandName") or ""
+            for item in prod.get("items", []):
+                sku_id = item.get("itemId")
+                ean = None
+                # Extract EAN from variations or additionalInfo when present
+                # The EAN is often stored in the `referenceId` list
+                reference_ids = item.get("referenceId") or []
+                for ref in reference_ids:
+                    if ref.get("Key", "").lower() in {"ean", "ean13", "gtin"}:
+                        ean = ref.get("Value")
+                        break
+                # Choose the first image URL if available
+                images = item.get("images") or []
+                img_url = images[0].get("imageUrl", "") if images else ""
+                products.append({
+                    "product_id": prod_id,
+                    "sku_id": sku_id,
+                    "name": name,
+                    "brand": brand,
+                    "ean": ean,
+                    "image_url": img_url,
+                    "category_id": category_id,
+                })
+        start += VTEX_PAGE_SIZE
+    return products
+
+
+async def vtex_fetch_prices(client: httpx.AsyncClient, base_url: str, skus: list[str]) -> dict[str, tuple[float, float, bool]]:
+    """Fetch current prices and stock availability for a list of SKU IDs.
+
+    The `/api/checkout/pub/orderForms/simulation` endpoint accepts a JSON
+    payload with an `items` list.  Each item must contain `id` (SKU),
+    `quantity` and `seller` (usually "1").  The response contains an
+    `items` array with `price`, `listPrice` and `availability` flags.
+
+    To avoid extremely large payloads and potential rate limiting this
+    function processes the input SKUs in batches of 50.  Returns a mapping
+    of SKU IDs to a triple `(price, list_price, available)`.
+
+    Args:
+        client: an `httpx.AsyncClient` instance.
+        base_url: e.g. "disco.com.uy".
+        skus: list of SKU strings.
+
+    Returns:
+        Dict mapping sku_id to (price, list_price, available).  If a price is
+        missing or invalid it will be omitted from the result mapping.
+    """
+    results: dict[str, tuple[float, float, bool]] = {}
+    batch_size = 50
+    for i in range(0, len(skus), batch_size):
+        batch = skus[i : i + batch_size]
+        payload = {
+            "items": [
+                {"id": sku, "quantity": 1, "seller": "1"}
+                for sku in batch
+            ]
+        }
+        url = f"https://{base_url}/api/checkout/pub/orderForms/simulation"
+        try:
+            r = await client.post(url, headers=JSON_HEADERS, json=payload, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            for item in data.get("items", []):
+                sku = item.get("id")
+                price = item.get("price")
+                list_price = item.get("listPrice") or price
+                avail = item.get("availability", "") == "available"
+                if sku and isinstance(price, (int, float)):
+                    results[str(sku)] = (
+                        float(price) / 100 if price > 1e4 else float(price),
+                        float(list_price) / 100 if list_price and list_price > 1e4 else float(list_price) if list_price is not None else float(price),
+                        avail,
+                    )
+        except Exception as e:
+            log.warning(f"[vtex][{base_url}] price fetch batch starting {i}: {e}")
+    return results
+
+
+async def scrape_vtex_chain(chain: str, domain: str) -> list[dict]:
+    """Scrape a full VTEX chain by listing categories, enumerating products and
+    fetching their prices.
+
+    This function orchestrates calls to `vtex_list_categories`,
+    `vtex_fetch_category_products` and `vtex_fetch_prices`.  Categories are
+    processed concurrently to maximise throughput.  After retrieving basic
+    product information for all categories, price and availability data
+    are fetched in batches via the simulation endpoint.  Results are
+    deduplicated by SKU ID and filtered for price sanity.
+
+    Args:
+        chain: the chain identifier (e.g. "disco").  Will be stored in the
+            resulting rows.
+        domain: the VTEX base domain (e.g. "disco.com.uy").
+
+    Returns:
+        List of dictionaries ready for DB insertion with the fields:
+        `ean`, `chain`, `product_id`, `sku_id`, `name`, `brand`, `category`,
+        `image_url`, `price`, `list_price`, `available` and `scraped_at`.
+    """
+    log.info(f"[{chain}] VTEX scrape starting")
+    rows: list[dict] = []
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        categories = await vtex_list_categories(client, domain)
+        if not categories:
+            log.warning(f"[{chain}] No categories returned from VTEX API, falling back to legacy scraper")
+            return rows
+
+        # Build tasks to fetch products per category concurrently.  Use a
+        # semaphore to limit concurrency to 5 categories at a time to avoid
+        # overwhelming the server.
+        sem = asyncio.Semaphore(5)
+
+        async def fetch_cat(cat):
+            async with sem:
+                cid = cat["id"]
+                cname = cat["name"]
+                prods = await vtex_fetch_category_products(client, domain, cid)
+                for p in prods:
+                    p["category"] = cname
+                return prods
+
+        tasks = [fetch_cat(cat) for cat in categories]
+        all_prods_lists = await asyncio.gather(*tasks, return_exceptions=True)
+        basic_products: list[dict] = []
+        for res in all_prods_lists:
+            if isinstance(res, Exception):
+                log.warning(f"[{chain}] Category fetch error: {res}")
+            else:
+                basic_products.extend(res)
+
+        if not basic_products:
+            log.warning(f"[{chain}] No products found via VTEX API")
+            return rows
+
+        # Fetch prices for all SKUs
+        sku_ids = [p["sku_id"] for p in basic_products if p.get("sku_id")]
+        price_map = await vtex_fetch_prices(client, domain, sku_ids)
+
+        for prod in basic_products:
+            sku_id = str(prod.get("sku_id"))
+            price_tuple = price_map.get(sku_id)
+            # Skip products with missing or invalid price
+            if not price_tuple:
+                continue
+            price, list_price, available = price_tuple
+            # Filter out crazy prices
+            if not (0 < price < MAX_PRICE):
+                continue
+            ean = prod.get("ean")
+            rows.append({
+                "ean":        ean,
+                "chain":      chain,
+                "product_id": prod.get("product_id"),
+                "sku_id":     sku_id,
+                "name":       (prod.get("name") or "")[:200],
+                "brand":      (prod.get("brand") or "")[:100],
+                "category":   prod.get("category") or "",
+                "image_url":  (prod.get("image_url") or "")[:500],
+                "price":      price,
+                "list_price": list_price,
+                "available":  available,
+                "scraped_at": now_iso(),
+            })
+    # Deduplicate final rows by sku_id
+    deduped = {r["sku_id"]: r for r in rows}
+    unique_rows = list(deduped.values())
+    log.info(f"[{chain}] VTEX scrape finished: {len(unique_rows)} unique items")
+    return unique_rows
+
+
 # ── Utilidades comunes ────────────────────────────────────────────────────────
 
 def parse_price(raw: str) -> float | None:
@@ -750,11 +1043,15 @@ async def main():
     sb        = create_client(SUPABASE_URL, SUPABASE_KEY)
     run_start = datetime.now(timezone.utc)
 
+    # Kick off scraping tasks.  For VTEX chains (Disco, Devoto, Géant, TaTa) we
+    # leverage the VTEX API via `scrape_vtex_chain` instead of the legacy
+    # HTML/GraphQL scrapers.  Tienda Inglesa still relies on the custom HTML
+    # scraper as it runs on a bespoke platform.
     tasks = [
-        run_and_save_chain(sb, "disco", run_start, scrape_gdu_chain, "disco", GDU_CHAINS["disco"]),
-        run_and_save_chain(sb, "devoto", run_start, scrape_gdu_chain, "devoto", GDU_CHAINS["devoto"]),
-        run_and_save_chain(sb, "geant", run_start, scrape_gdu_chain, "geant", GDU_CHAINS["geant"]),
-        run_and_save_chain(sb, "tata", run_start, scrape_tata),
+        run_and_save_chain(sb, "disco", run_start, scrape_vtex_chain, "disco", VTEX_CHAINS["disco"]),
+        run_and_save_chain(sb, "devoto", run_start, scrape_vtex_chain, "devoto", VTEX_CHAINS["devoto"]),
+        run_and_save_chain(sb, "geant", run_start, scrape_vtex_chain, "geant", VTEX_CHAINS["geant"]),
+        run_and_save_chain(sb, "tata", run_start, scrape_vtex_chain, "tata", VTEX_CHAINS["tata"]),
         run_and_save_chain(sb, "tienda_inglesa", run_start, scrape_tienda_inglesa),
     ]
     

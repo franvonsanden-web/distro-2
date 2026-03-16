@@ -750,4 +750,16 @@ async def main():
     sb        = create_client(SUPABASE_URL, SUPABASE_KEY)
     run_start = datetime.now(timezone.utc)
 
-    tasks =
+    tasks = [
+        run_and_save_chain(sb, "disco", run_start, scrape_gdu_chain, "disco", GDU_CHAINS["disco"]),
+        run_and_save_chain(sb, "devoto", run_start, scrape_gdu_chain, "devoto", GDU_CHAINS["devoto"]),
+        run_and_save_chain(sb, "geant", run_start, scrape_gdu_chain, "geant", GDU_CHAINS["geant"]),
+        run_and_save_chain(sb, "tata", run_start, scrape_tata),
+        run_and_save_chain(sb, "tienda_inglesa", run_start, scrape_tienda_inglesa),
+    ]
+    
+    await asyncio.gather(*tasks)
+    log.info("=" * 60 + " FIN")
+
+if __name__ == "__main__":
+    asyncio.run(main())

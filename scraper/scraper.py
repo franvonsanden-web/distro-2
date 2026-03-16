@@ -346,6 +346,39 @@ async def scrape_vtex_chain(chain: str, domain: str) -> list[dict]:
     return unique_rows
 
 
+async def scrape_chain_with_fallback(
+    chain: str,
+    domain: str,
+    fallback_func,
+    *fallback_args,
+) -> list[dict]:
+    """Attempt to scrape a chain via the VTEX API and fall back to a legacy
+    scraper if no data is returned.
+
+    Some chains may migrate away from VTEX or block direct API access.  To
+    ensure continued coverage we first call `scrape_vtex_chain`.  If that
+    returns a non‑empty list, it will be used.  Otherwise, the provided
+    `fallback_func` is invoked with the supplied arguments.
+
+    Args:
+        chain: Identifier for the supermarket chain.
+        domain: VTEX domain (used only for the VTEX attempt).
+        fallback_func: Async function to call if the VTEX scrape fails.
+        fallback_args: Arguments for the fallback function.
+
+    Returns:
+        List of scraped product dictionaries.
+    """
+    try:
+        rows = await scrape_vtex_chain(chain, domain)
+        if rows:
+            return rows
+    except Exception as e:
+        log.warning(f"[{chain}] VTEX scrape error, falling back: {e}")
+    # Fallback to legacy
+    return await fallback_func(*fallback_args)
+
+
 # ── Utilidades comunes ────────────────────────────────────────────────────────
 
 def parse_price(raw: str) -> float | None:
@@ -1048,10 +1081,48 @@ async def main():
     # HTML/GraphQL scrapers.  Tienda Inglesa still relies on the custom HTML
     # scraper as it runs on a bespoke platform.
     tasks = [
-        run_and_save_chain(sb, "disco", run_start, scrape_vtex_chain, "disco", VTEX_CHAINS["disco"]),
-        run_and_save_chain(sb, "devoto", run_start, scrape_vtex_chain, "devoto", VTEX_CHAINS["devoto"]),
-        run_and_save_chain(sb, "geant", run_start, scrape_vtex_chain, "geant", VTEX_CHAINS["geant"]),
-        run_and_save_chain(sb, "tata", run_start, scrape_vtex_chain, "tata", VTEX_CHAINS["tata"]),
+        run_and_save_chain(
+            sb,
+            "disco",
+            run_start,
+            scrape_chain_with_fallback,
+            "disco",
+            VTEX_CHAINS["disco"],
+            scrape_gdu_chain,
+            "disco",
+            GDU_CHAINS["disco"],
+        ),
+        run_and_save_chain(
+            sb,
+            "devoto",
+            run_start,
+            scrape_chain_with_fallback,
+            "devoto",
+            VTEX_CHAINS["devoto"],
+            scrape_gdu_chain,
+            "devoto",
+            GDU_CHAINS["devoto"],
+        ),
+        run_and_save_chain(
+            sb,
+            "geant",
+            run_start,
+            scrape_chain_with_fallback,
+            "geant",
+            VTEX_CHAINS["geant"],
+            scrape_gdu_chain,
+            "geant",
+            GDU_CHAINS["geant"],
+        ),
+        run_and_save_chain(
+            sb,
+            "tata",
+            run_start,
+            scrape_chain_with_fallback,
+            "tata",
+            VTEX_CHAINS["tata"],
+            scrape_tata,
+        ),
         run_and_save_chain(sb, "tienda_inglesa", run_start, scrape_tienda_inglesa),
     ]
     

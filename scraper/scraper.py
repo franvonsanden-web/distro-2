@@ -1,13 +1,13 @@
 """
-scraper.py v5 — distro
+scraper.py v5.1 — distro
 ═══════════════════════════════════════════════════════════════════
-Cambios vs v4:
-  • Disco / Devoto / Géant → httpx + BeautifulSoup (HTML parsing)
-    Sin Playwright. 9 categorías × ~45 páginas ≈ 8.000+ prods/cadena.
-  • TaTa → httpx + GraphQL POST
-    Sin Playwright. 8 categorías, ~10.000 productos.
-  • Tienda Inglesa → igual que v4 (httpx + BeautifulSoup)
-  • Playwright eliminado por completo → más rápido y más estable.
+Cambios vs v5.0:
+  • Supabase batched IN queries (Bypasses PostgREST 1,000 row limit).
+  • Conditional history logging (Stops DB exponential bloat).
+  • True concurrency across chains via asyncio.gather().
+  • Asynchronous DB wrapper to prevent event-loop blocking.
+  • Category-level error boundaries (Prevents full chain data loss).
+  • Updated User-Agent to newer Chrome versions.
 ═══════════════════════════════════════════════════════════════════
 """
 
@@ -37,7 +37,8 @@ GDU_PAGE_DELAY   = 1.5       # segundos entre páginas (evita throttling desde d
 GDU_RETRY_WAIT   = 8.0       # espera antes de reintentar una página vacía
 GDU_RETRIES      = 2         # reintentos por página vacía antes de contarla como vacía
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
+# Updated to a more recent Chrome version
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 HTML_HEADERS = {
     "User-Agent": UA,
@@ -95,7 +96,7 @@ GDU_CHAINS = {
 }
 
 # Categorías confirmadas (probadas en probe_apis4.py)
-GDU_CATEGORIES = [
+GDU_CATEGORIES =[
     ("almacen",           "almacen"),
     ("bebidas",           "bebidas"),
     ("frescos",           "frescos"),
@@ -111,7 +112,7 @@ GDU_CATEGORIES = [
 def _parse_gdu_page(html: str, chain: str, category: str) -> list[dict]:
     """Extrae productos de una página HTML de Disco/Devoto/Géant."""
     soup = BeautifulSoup(html, "lxml")
-    products = []
+    products =[]
 
     for card in soup.select("div.product-item"):
         # Nombre
@@ -217,7 +218,7 @@ async def scrape_gdu_category(
     cat_name: str,
     cat_slug: str,
 ) -> list[dict]:
-    rows: list[dict] = []
+    rows: list[dict] =[]
     seen_skus: set  = set()
     consec_empty    = 0
 
@@ -257,13 +258,17 @@ async def scrape_gdu_category(
 
 async def scrape_gdu_chain(chain: str, base_url: str) -> list[dict]:
     log.info(f"[{chain}] Iniciando (httpx HTML)")
-    all_rows: list[dict] = []
+    all_rows: list[dict] =[]
 
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         for cat_name, cat_slug in GDU_CATEGORIES:
-            rows = await scrape_gdu_category(client, chain, base_url, cat_name, cat_slug)
-            all_rows.extend(rows)
-            log.info(f"[{chain}][{cat_name}] ✓ {len(rows)} — acumulado: {len(all_rows)}")
+            try:
+                rows = await scrape_gdu_category(client, chain, base_url, cat_name, cat_slug)
+                all_rows.extend(rows)
+                log.info(f"[{chain}][{cat_name}] ✓ {len(rows)} — acumulado: {len(all_rows)}")
+            except Exception as e:
+                # Catch failures locally so we don't lose data from successful categories
+                log.error(f"[{chain}][{cat_name}] FALLO: {e}")
             await asyncio.sleep(0.4)
 
     # Deduplicar por sku_id
@@ -317,7 +322,7 @@ TATA_QUERY = """query ProductsQuery($first: Int!, $after: String, $sort: StoreSo
 }"""
 
 # Categorías confirmadas con totalCount > 0
-TATA_CATEGORIES = [
+TATA_CATEGORIES =[
     ("almacen",     "almacen"),
     ("frescos",     "frescos"),
     ("bebidas",     "bebidas"),
@@ -399,7 +404,8 @@ def _tata_node_to_row(node: dict, category: str) -> dict | None:
         list_price = price
 
     gtin = node.get("gtin") or None
-    sku_id = node.get("slug") or node.get("sku") or hashlib.md5(name.encode()).hexdigest()[:20]
+    # Prefer GTIN or SKU first over dynamic slug if possible
+    sku_id = gtin or node.get("sku") or node.get("slug") or hashlib.md5(name.encode()).hexdigest()[:20]
     brand = (node.get("brand") or {}).get("name", "") or (node.get("brand") or {}).get("brandName", "")
     img_list = node.get("image") or []
     img = img_list[0].get("url", "") if img_list else ""
@@ -425,7 +431,7 @@ async def scrape_tata_category(
     cat_name: str,
     cat_facet: str,
 ) -> list[dict]:
-    rows: list[dict] = []
+    rows: list[dict] =[]
     seen_skus: set  = set()
     after = 0
 
@@ -461,13 +467,16 @@ async def scrape_tata_category(
 
 async def scrape_tata() -> list[dict]:
     log.info("[tata] Iniciando (GraphQL POST)")
-    all_rows: list[dict] = []
+    all_rows: list[dict] =[]
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         for cat_name, cat_facet in TATA_CATEGORIES:
-            rows = await scrape_tata_category(client, cat_name, cat_facet)
-            all_rows.extend(rows)
-            log.info(f"[tata][{cat_name}] ✓ {len(rows)} — acumulado: {len(all_rows)}")
+            try:
+                rows = await scrape_tata_category(client, cat_name, cat_facet)
+                all_rows.extend(rows)
+                log.info(f"[tata][{cat_name}] ✓ {len(rows)} — acumulado: {len(all_rows)}")
+            except Exception as e:
+                log.error(f"[tata][{cat_name}] FALLO: {e}")
             await asyncio.sleep(0.5)
 
     # Deduplicar
@@ -488,11 +497,11 @@ TI_HEADERS = {
 }
 
 TI_SEARCH_TERMS = [
-    ("bebidas",    ["agua mineral", "jugo", "refresco", "cerveza", "vino", "gaseosa"]),
+    ("bebidas",["agua mineral", "jugo", "refresco", "cerveza", "vino", "gaseosa"]),
     ("lacteos",    ["leche", "queso", "yogur", "manteca", "crema de leche"]),
-    ("limpieza",   ["detergente", "lavandina", "jabon loza", "suavizante", "desengrasante"]),
-    ("perfumeria", ["shampoo", "desodorante", "jabon liquido", "crema corporal", "pasta dental"]),
-    ("congelados", ["helado", "pizza congelada", "empanada congelada", "milanesa congelada"]),
+    ("limpieza",["detergente", "lavandina", "jabon loza", "suavizante", "desengrasante"]),
+    ("perfumeria",["shampoo", "desodorante", "jabon liquido", "crema corporal", "pasta dental"]),
+    ("congelados",["helado", "pizza congelada", "empanada congelada", "milanesa congelada"]),
 ]
 
 
@@ -530,7 +539,7 @@ async def _parse_ti_card(card, cat_name: str) -> dict | None:
 
 async def scrape_tienda_inglesa() -> list[dict]:
     chain = "tienda_inglesa"
-    rows: list[dict] = []
+    rows: list[dict] =[]
     seen_ids: set   = set()
     log.info(f"[{chain}] Iniciando")
 
@@ -613,38 +622,48 @@ async def scrape_tienda_inglesa() -> list[dict]:
 # ── Supabase ──────────────────────────────────────────────────────────────────
 
 def upsert_prices(sb: Client, rows: list, chain: str) -> dict:
+    """Inserta y actualiza en lote. Bypassea límite de 1,000 filas de PostgREST y evita bloat exponencial."""
     if not rows:
         return {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 0}
 
     stats = {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 0}
 
-    # Cargar precios actuales para detectar cambios
-    existing: dict = {}
-    try:
-        resp = sb.table("prices_current").select("sku_id,price").eq("chain", chain).execute()
-        for row in resp.data:
-            existing[row["sku_id"]] = float(row["price"])
-    except Exception as e:
-        log.warning(f"No se pudo cargar precios actuales de {chain}: {e}")
-
-    # Deduplicar
-    deduped: dict = {}
-    for row in rows:
-        deduped[row["sku_id"]] = row
+    # Deduplicar en memoria
+    deduped = {r["sku_id"]: r for r in rows}
     deduped_list = list(deduped.values())
 
-    price_changes: list = []
+    price_changes =[]
     BATCH = 500
 
     for i in range(0, len(deduped_list), BATCH):
         batch = deduped_list[i: i + BATCH]
+        batch_skus = [r["sku_id"] for r in batch]
+        
+        # 1. Obtener precios existentes SOLAMENTE para los SKUs en este batch (Bypassea límite de 1,000)
+        existing = {}
+        try:
+            resp = sb.table("prices_current").select("sku_id,price") \
+                     .eq("chain", chain).in_("sku_id", batch_skus).execute()
+            for row in resp.data:
+                existing[row["sku_id"]] = float(row["price"])
+        except Exception as e:
+            log.warning(f"No se pudo cargar precios actuales para {chain} batch {i//BATCH}: {e}")
 
+        history_batch = []
+        current_batch =[]
+
+        # 2. Comparar y categorizar datos
         for row in batch:
             old = existing.get(row["sku_id"])
             if old is None:
                 stats["inserted"] += 1
+                history_batch.append(row)   # Guardar historial si es NUEVO
+                current_batch.append(row)
             elif abs(old - row["price"]) > 0.01:
                 stats["updated"] += 1
+                history_batch.append(row)   # Guardar historial si CAMBIÓ EL PRECIO
+                current_batch.append(row)
+                
                 pct = ((row["price"] - old) / old) * 100
                 price_changes.append({
                     "chain":      row["chain"],
@@ -657,19 +676,29 @@ def upsert_prices(sb: Client, rows: list, chain: str) -> dict:
                 })
             else:
                 stats["unchanged"] += 1
+                current_batch.append(row)   # Se hace upsert a current para actualizar "scraped_at"
 
-        try:
-            sb.table("prices_history").insert(batch).execute()
-            sb.table("prices_current").upsert(batch, on_conflict="chain,sku_id").execute()
-        except Exception as e:
-            log.error(f"Error upsert batch {i // BATCH}: {e}")
-            stats["errors"] += len(batch)
+        # 3. Ejecución Independiente de Queries
+        if history_batch:
+            try:
+                sb.table("prices_history").insert(history_batch).execute()
+            except Exception as e:
+                log.error(f"Error insertando history batch {i//BATCH}: {e}")
+                stats["errors"] += len(history_batch)
 
-    if price_changes:
+        if current_batch:
+            try:
+                sb.table("prices_current").upsert(current_batch, on_conflict="chain,sku_id").execute()
+            except Exception as e:
+                log.error(f"Error upserting current batch {i//BATCH}: {e}")
+                stats["errors"] += len(current_batch)
+
+    # 4. Insertar notificaciones de cambios de precio (en batches seguros)
+    for i in range(0, len(price_changes), BATCH):
         try:
-            sb.table("price_changes").insert(price_changes).execute()
+            sb.table("price_changes").insert(price_changes[i:i+BATCH]).execute()
         except Exception as e:
-            log.warning(f"Error price_changes: {e}")
+            log.warning(f"Error insertando price_changes: {e}")
 
     return stats
 
@@ -691,52 +720,34 @@ def log_run(sb: Client, chain: str, run_start: datetime, rows: list, stats: dict
         log.error(f"Error log {chain}: {e}")
 
 
+# ── Wrapper Concurrente ───────────────────────────────────────────────────────
+
+async def run_and_save_chain(sb: Client, chain: str, run_start: datetime, scraper_func, *args):
+    """Ejecuta un scraper, hace el upsert (en otro thread) y registra el run en base de datos."""
+    t0 = time.time()
+    rows =[]
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 0}
+    
+    try:
+        rows = await scraper_func(*args)
+        # Correr el cliente sincrónico de Supabase en un thread separado
+        # para que no bloquee las descargas HTTP asíncronas de otros supermercados.
+        stats = await asyncio.to_thread(upsert_prices, sb, rows, chain)
+    except Exception as e:
+        log.error(f"[{chain}] FALLO CRITICO: {e}")
+        stats["errors"] += 1
+        
+    elapsed = round(time.time() - t0, 1)
+    
+    await asyncio.to_thread(log_run, sb, chain, run_start, rows, stats, elapsed)
+    log.info(f"[{chain}] FINALIZADO: scraped={len(rows)} new={stats.get('inserted', 0)} updated={stats.get('updated', 0)} ({elapsed}s)")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    log.info("=" * 60 + " scraper v5")
+    log.info("=" * 60 + " scraper v5.1")
     sb        = create_client(SUPABASE_URL, SUPABASE_KEY)
     run_start = datetime.now(timezone.utc)
 
-    # GDU chains (Disco, Devoto, Géant)
-    for chain, base_url in GDU_CHAINS.items():
-        t0 = time.time()
-        try:
-            rows  = await scrape_gdu_chain(chain, base_url)
-            stats = upsert_prices(sb, rows, chain)
-        except Exception as e:
-            log.error(f"[{chain}] FALLO: {e}")
-            rows, stats = [], {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 1}
-        elapsed = round(time.time() - t0, 1)
-        log_run(sb, chain, run_start, rows, stats, elapsed)
-        log.info(f"[{chain}] scraped={len(rows)} new={stats['inserted']} updated={stats['updated']} ({elapsed}s)")
-
-    # TaTa
-    t0 = time.time()
-    try:
-        rows  = await scrape_tata()
-        stats = upsert_prices(sb, rows, "tata")
-    except Exception as e:
-        log.error(f"[tata] FALLO: {e}")
-        rows, stats = [], {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 1}
-    elapsed = round(time.time() - t0, 1)
-    log_run(sb, "tata", run_start, rows, stats, elapsed)
-    log.info(f"[tata] scraped={len(rows)} new={stats['inserted']} updated={stats['updated']} ({elapsed}s)")
-
-    # Tienda Inglesa
-    t0 = time.time()
-    try:
-        rows  = await scrape_tienda_inglesa()
-        stats = upsert_prices(sb, rows, "tienda_inglesa")
-    except Exception as e:
-        log.error(f"[tienda_inglesa] FALLO: {e}")
-        rows, stats = [], {"inserted": 0, "updated": 0, "unchanged": 0, "errors": 1}
-    elapsed = round(time.time() - t0, 1)
-    log_run(sb, "tienda_inglesa", run_start, rows, stats, elapsed)
-    log.info(f"[tienda_inglesa] scraped={len(rows)} new={stats['inserted']} ({elapsed}s)")
-
-    log.info("=" * 60 + " FIN")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    tasks =
